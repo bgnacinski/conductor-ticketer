@@ -1,5 +1,6 @@
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, ec
+from cryptography.hazmat.primitives.serialization import ssh
+from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, ec, padding
 from cryptography.exceptions import InvalidSignature 
 import asyncio
 import os
@@ -13,16 +14,19 @@ ALLOWED_KEY_TYPES = [
     ec.EllipticCurvePublicKey
 ]
 
+with open("crypto/ca_key.pub", "rb") as f:
+    PUBKEY = serialization.load_ssh_public_key(f.read())
+
 async def data_pusher():
     pass
 
-def get_fingerprint(pubkey: serialization.SSHPublicKeyTypes) -> str:
+def get_fingerprint(pubkey: serialization.SSHCertPublicKeyTypes) -> str:
     """
     Generate a SHA256 fingerprint from user's public key
     """
     return str(serialization.ssh_key_fingerprint(pubkey, hashes.SHA256()))
 
-def is_key_algo_secure(pubkey: serialization.SSHPublicKeyTypes) -> bool:
+def is_key_algo_secure(pubkey: serialization.SSHCertPublicKeyTypes) -> bool:
     """
     Used to detect weak key algorithms
     """
@@ -30,52 +34,114 @@ def is_key_algo_secure(pubkey: serialization.SSHPublicKeyTypes) -> bool:
     global MIN_RSA_KEY_SIZE
     global MIN_ECDSA_KEY_SIZE
     
-    if type(pubkey) in ALLOWED_KEY_TYPES:
-        if type(pubkey) == rsa.RSAPublicKey and pubkey.key_size < MIN_RSA_KEY_SIZE:
-            return False
-        
-        elif type(pubkey) == ec.EllipticCurvePublicKey and pubkey.key_size < MIN_ECDSA_KEY_SIZE:
-            return False
-        
-        else:
-            return True
+    if isinstance(pubkey, ed25519.Ed25519PublicKey):
+        return True
+
+    elif isinstance(pubkey, ec.EllipticCurvePublicKey) and pubkey.key_size >= MIN_ECDSA_KEY_SIZE:
+        return True
     
-    else:
+    elif isinstance(pubkey, rsa.RSAPublicKey) and pubkey.key_size >= MIN_RSA_KEY_SIZE:
+        return True
+        
+    return False
+
+def is_cert_valid(cert) -> bool:
+    global PUBKEY
+    
+    if not isinstance(cert, ssh.SSHCertificate):
+        print("[!] Received data is not a certificate")
         return False
     
-def verify_signature(pubkey: serialization.SSHPublicKeyTypes, response: bytes) -> bool:
-    pass
-
+    try:
+        cert.verify_cert_signature()
+        print("[*] Valid certificate")
+ 
+        return True
+    
+    except:
+        print("[!] Invalid certificate")
+        return False
+    
+def verify_signature(pubkey: serialization.SSHCertPublicKeyTypes, nonce:bytes, response: bytes) -> bool:
+    try:
+        if isinstance(pubkey, ed25519.Ed25519PublicKey):
+            pubkey.verify(response, nonce)
+            return True
+        
+        elif isinstance(pubkey, ec.EllipticCurvePublicKey):
+            if pubkey.key_size <= 256:
+                hash_algo = hashes.SHA256()
+            elif pubkey.key_size <= 384:
+                hash_algo = hashes.SHA384()
+            else:
+                hash_algo = hashes.SHA512()
+                
+            pubkey.verify(response, nonce, ec.ECDSA(hash_algo))
+            return True
+            
+        elif isinstance(pubkey, rsa.RSAPublicKey) and pubkey.key_size >= MIN_RSA_KEY_SIZE:
+            try:
+                pubkey.verify(
+                    response,
+                    nonce,
+                    padding.PKCS1v15(),
+                    hashes.SHA512()
+                )
+            except InvalidSignature:
+                pubkey.verify(
+                    response,
+                    nonce,
+                    padding.PKCS1v15(),
+                    hashes.SHA256()
+                )
+                
+            return True
+        
+    except:
+        return False
+    
+    return False
+    
 async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     print("[*] Client connected! Waiting for public key...")
-    client_pubkey_raw = await reader.readline()
-    print("[*] Recieved public key, key length: ", len(client_pubkey_raw))
+    client_cert_raw = await reader.readline()
+    print(client_cert_raw)
+    print("[*] Recieved public key, key length: ", len(client_cert_raw.strip()))
     
     try:
-        # serialize client public key
-        client_pubkey = serialization.load_ssh_public_key(client_pubkey_raw.strip())
+        # serialize client certificate
+        client_cert = serialization.load_ssh_public_identity(client_cert_raw.strip())
+        client_pubkey = client_cert.public_key()
         
-        # check key algorithm
+        # check certificate
+        if not is_cert_valid(client_cert):
+            writer.write(b"INVALID_CERT")
+            await writer.drain()
+            return
+                
+        # check key algo
         if not is_key_algo_secure(client_pubkey):
-            writer.write(b"")
+            writer.write(b"KEY_NOT_SECURE")
+            await writer.drain()
+            return
         
-        challenge = os.urandom(CHALL_SIZE)
+        nonce = os.urandom(CHALL_SIZE)
         
-        writer.write(challenge)
+        writer.write(nonce)
         await writer.drain()
         
         response = await reader.read(1024)
 
-        if verify_signature(client_pubkey, response):
-            print("[*] OK. Bramka otwarta")
+        if verify_signature(client_pubkey, nonce, response):
+            print("[*] OK. Gate open")
             writer.write(b"OK")
             await writer.drain()
             
         else:
             raise InvalidSignature
         
-    except InvalidSignature:
-        print("[!] FAIL. Bramka zamknięta")
+    except Exception as e:
+        print(f"[!] Other error: {e}")
         writer.write(b"FAIL")
         await writer.drain()
         
