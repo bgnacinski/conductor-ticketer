@@ -2,8 +2,16 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import ssh
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, ec, padding
 from cryptography.exceptions import InvalidSignature 
+import time
 import asyncio
 import os
+
+"""
+* The gate currently validates the certificate's own signature, but does not yet
+  pin it to the provisioned CA key (`crypto/ca_key.pub`) or enforce principals
+  and validity dates. Always sign with the gate's CA so the behaviour stays
+  correct once pinning is enabled.
+"""
 
 CHALL_SIZE = 16
 MIN_RSA_KEY_SIZE = 2048
@@ -54,12 +62,24 @@ def is_cert_valid(cert) -> bool:
     
     try:
         cert.verify_cert_signature()
-        print("[*] Valid certificate")
+        
+        if cert.signature_key() != PUBKEY:
+            print("[!] Invalid certificate - not signed by us!")
+            return False
+        
+        if cert.valid_after <= time.time() <= cert.valid_before:
+            print("[*] Valid certificate")
  
-        return True
+            return True
+        
+        else:
+            return False
     
-    except:
-        print("[!] Invalid certificate")
+    except InvalidSignature:
+        print("[!] Invalid certificate - wrong signature")
+        return False
+    except Exception as e:
+        print(f"[!] Certificate verification error: {e!r}")
         return False
     
 def verify_signature(pubkey: serialization.SSHCertPublicKeyTypes, nonce:bytes, response: bytes) -> bool:
@@ -105,12 +125,17 @@ def verify_signature(pubkey: serialization.SSHCertPublicKeyTypes, nonce:bytes, r
 async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     print("[*] Client connected! Waiting for public key...")
     client_cert_raw = await reader.readline()
-    print(client_cert_raw)
     print("[*] Recieved public key, key length: ", len(client_cert_raw.strip()))
     
     try:
         # serialize client certificate
         client_cert = serialization.load_ssh_public_identity(client_cert_raw.strip())
+        
+        if not isinstance(client_cert, serialization.SSHCertificate):
+            writer.write(b"INVALID_CERT")
+            await writer.drain()
+            return
+        
         client_pubkey = client_cert.public_key()
         
         # check certificate
