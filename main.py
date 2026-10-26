@@ -2,18 +2,14 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import ssh
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, ec, padding
 from cryptography.exceptions import InvalidSignature 
+from Exchanger import Outbox
 import time
 import asyncio
 import os
 
-"""
-* The gate currently validates the certificate's own signature, but does not yet
-  pin it to the provisioned CA key (`crypto/ca_key.pub`) or enforce principals
-  and validity dates. Always sign with the gate's CA so the behaviour stays
-  correct once pinning is enabled.
-"""
-
-CHALL_SIZE = 16
+BULK_PUSH = str(os.getenv("BULK_PUSH")).lower() in ("true", "yes")
+PUSH_INTERVAL = int(str(os.getenv("PUSH_INTERVAL"))) or 1800
+CHALL_SIZE = int(str(os.getenv("NONCE_SIZE"))) or 16
 MIN_RSA_KEY_SIZE = 2048
 MIN_ECDSA_KEY_SIZE = 256
 ALLOWED_KEY_TYPES = [
@@ -24,15 +20,6 @@ ALLOWED_KEY_TYPES = [
 
 with open("crypto/ca_key.pub", "rb") as f:
     PUBKEY = serialization.load_ssh_public_key(f.read())
-
-async def data_pusher():
-    pass
-
-def get_fingerprint(pubkey: serialization.SSHCertPublicKeyTypes) -> str:
-    """
-    Generate a SHA256 fingerprint from user's public key
-    """
-    return str(serialization.ssh_key_fingerprint(pubkey, hashes.SHA256()))
 
 def is_key_algo_secure(pubkey: serialization.SSHCertPublicKeyTypes) -> bool:
     """
@@ -158,6 +145,9 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         response = await reader.read(1024)
 
         if verify_signature(client_pubkey, nonce, response):
+            outbox = await Outbox.create()
+            await outbox.log(ssh.serialize_ssh_public_key(client_pubkey))
+            
             print("[*] OK. Gate open")
             writer.write(b"OK")
             await writer.drain()
@@ -165,14 +155,35 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         else:
             raise InvalidSignature
         
-    except Exception as e:
-        print(f"[!] Other error: {e}")
+    except InvalidSignature:
+        print(f"[!] Invalid signature")
         writer.write(b"FAIL")
         await writer.drain()
         
 async def main(): 
-    server = await asyncio.start_server(client_handler, "localhost", 2137)    
+    await Outbox.cleanup()
+    outbox = await Outbox.create()
+    
+    sync_task = asyncio.create_task(sync_with_api(outbox))
+    
+    try:
+        server = await asyncio.start_server(client_handler, "localhost", 2137)    
 
-    await server.serve_forever()
-
+        await server.serve_forever()
+        
+    finally:
+        sync_task.cancel()
+            
+        await outbox.close()
+    
+async def sync_with_api(outbox: Outbox):
+    while True:
+        try:
+            await outbox.push(BULK_PUSH)
+            
+        except Exception as e:
+            print(f"[!] Exception during sync occured: {e}")
+            
+        await asyncio.sleep(PUSH_INTERVAL)
+    
 asyncio.run(main())
