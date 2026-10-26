@@ -1,3 +1,9 @@
-GATE_TYPE=entry
-NONCE_SIZE=16
-DB_FILE=dsadasdsa.db
+GATE_ID=M1_1
+GATE_TYPE= #entry/exit
+NONCE_SIZE=32
+DB_FILE=db/outbox.db
+API_PUSH_URL=http://localhost:8080/api/push
+API_KEY=
+BULK_PUSH=false
+PUSH_INTERVAL=1800
+BATCH_SIZE=500
