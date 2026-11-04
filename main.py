@@ -51,7 +51,7 @@ def is_cert_valid(cert) -> bool:
         cert.verify_cert_signature()
         
         if cert.signature_key() != PUBKEY:
-            print("[!] Invalid certificate - not signed by us!")
+            print("[!] Invalid certificate - not signed by CA!")
             return False
         
         if cert.valid_after <= time.time() <= cert.valid_before:

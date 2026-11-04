@@ -77,7 +77,6 @@ class Outbox:
             "Authorization": f"Bearer {api_key}"
         }
         req_schema = {
-            "gate_id": self.gate_id,
             "bulk": bulk,
             "data": []
         }
@@ -122,13 +121,36 @@ class Outbox:
                             unsent.difference_update(batch_ids)
                             
                             return
-                            
-                        if res.is_success:
-                            await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({placeholders})", *batch_ids)
+                                            
+                        response = res.json()
+                        
+                        if res.status_code in (200, 201):
+                            await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({placeholders})", (*batch_ids,))
                             await self.db.commit()
                             print(f"[*] Exchanger | Successful API push of {len(batch_ids)}/{len(ids_to_send)} elements")
                             # USUNąĆ wysłane elementy z ids_to_send
                             unsent.difference_update(batch_ids)
+                            
+                        elif res.status_code == 207:
+                            created = response["created"]
+                            duplicates = response["duplicates"]
+                            failed = response["failed"]
+                            
+                            saved_ids = created + duplicates
+                            if len(saved_ids) > 0:
+                                saved_placeholders = ",".join("?" * len(saved_ids))
+                                await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({saved_placeholders})", (*saved_ids,))
+                                      
+                            if len(failed) > 0:
+                                fail_placeholders = ",".join("?" * len(failed))
+                                await self.db.execute(f"UPDATE outbox SET status='VALERR' WHERE id IN ({fail_placeholders})", (*failed,))
+                            
+                            await self.db.commit()
+                            
+                            unsent.difference_update(duplicates, created, failed)
+                            
+                            print(f"[*] Exchanger | Multi-Status response received. Created elements: {len(created)}, duplicate elements: {len(duplicates)}, failed elements: {len(failed)}")
+                            
                     
                         elif res.status_code // 100 == 5:
                             print("[!] Exchanger | API Server HTTP error: ", res.status_code, ". Unable to push data")
@@ -139,7 +161,7 @@ class Outbox:
                             
                             return
                 
-                        elif res.status_code // 100 == 4:
+                        elif res.status_code // 100 == 4:                                                   
                             if res.status_code in (401, 403):
                                 print("[!] Exchanger | Authentication failure - unable to push data. HTTP ", res.status_code)
                                 await self.db.execute(f"UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id IN ({placeholders})", (res.status_code, self._next_retry(), *batch_ids))
@@ -148,6 +170,28 @@ class Outbox:
                                 unsent.difference_update(batch_ids)
                                 
                                 return
+                            
+                            elif res.status_code == 409:
+                                duplicates = response["duplicates"]
+                                dup_placeholders = ", ".join("?" * len(duplicates))
+                                
+                                print(f"[*] Exchanger | Marking {len(duplicates)} duplicate elements as SENT")
+                            
+                                await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({dup_placeholders})", (*duplicates,))
+                                await self.db.commit()
+                            
+                                unsent.difference_update(duplicates)
+                                
+                            elif res.status_code == 422:
+                                failed_ids = response["failed"]
+                                
+                                fail_placeholders = ", ".join("?" * len(failed_ids))
+                                
+                                print(f"[!] Exchanger | HTTP 422 - Permanently removing {len(failed_ids)} from queue due to validation errors.")
+                                await self.db.execute(f"UPDATE outbox SET status='VALERR' WHERE id IN ({fail_placeholders})", (*failed_ids, ))
+                                await self.db.commit()
+                                
+                                unsent.difference_update(failed_ids)
                 
                             elif res.status_code == 429:
                                 print("[!] Exchanger | HTTP 429 - API server is probably overloaded. Aborting data push")
