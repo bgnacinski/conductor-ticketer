@@ -1,2 +1,8 @@
+.DS_Store
+.idea
+__pycache__/
 .venv
+.vscode
+.env
+db/*
 crypto/*

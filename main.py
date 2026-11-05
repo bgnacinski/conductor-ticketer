@@ -2,18 +2,16 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import ssh
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, ec, padding
 from cryptography.exceptions import InvalidSignature 
-import time
+from Exchanger import Outbox
+import aiosqlite
+import base64
 import asyncio
+import time
 import os
 
-"""
-* The gate currently validates the certificate's own signature, but does not yet
-  pin it to the provisioned CA key (`crypto/ca_key.pub`) or enforce principals
-  and validity dates. Always sign with the gate's CA so the behaviour stays
-  correct once pinning is enabled.
-"""
-
-CHALL_SIZE = 16
+BULK_PUSH = str(os.getenv("BULK_PUSH")).lower() in ("true", "yes")
+PUSH_INTERVAL = int(str(os.getenv("PUSH_INTERVAL"))) or 1800
+NONCE_SIZE = int(str(os.getenv("NONCE_SIZE"))) or 16
 MIN_RSA_KEY_SIZE = 2048
 MIN_ECDSA_KEY_SIZE = 256
 ALLOWED_KEY_TYPES = [
@@ -21,18 +19,7 @@ ALLOWED_KEY_TYPES = [
     ed25519.Ed25519PublicKey,
     ec.EllipticCurvePublicKey
 ]
-
-with open("crypto/ca_key.pub", "rb") as f:
-    PUBKEY = serialization.load_ssh_public_key(f.read())
-
-async def data_pusher():
-    pass
-
-def get_fingerprint(pubkey: serialization.SSHCertPublicKeyTypes) -> str:
-    """
-    Generate a SHA256 fingerprint from user's public key
-    """
-    return str(serialization.ssh_key_fingerprint(pubkey, hashes.SHA256()))
+PUBKEY = ""
 
 def is_key_algo_secure(pubkey: serialization.SSHCertPublicKeyTypes) -> bool:
     """
@@ -57,29 +44,30 @@ def is_cert_valid(cert) -> bool:
     global PUBKEY
     
     if not isinstance(cert, ssh.SSHCertificate):
-        print("[!] Received data is not a certificate")
+        print("[!] Client Handler | Received data is not a certificate")
         return False
     
     try:
         cert.verify_cert_signature()
         
         if cert.signature_key() != PUBKEY:
-            print("[!] Invalid certificate - not signed by us!")
+            print("[!] Client Handler | Invalid certificate - not signed by CA!")
             return False
         
         if cert.valid_after <= time.time() <= cert.valid_before:
-            print("[*] Valid certificate")
+            print("[*] Client Handler | Valid certificate")
  
             return True
         
         else:
+            print(f"[!] Client Handler | Certificate expired (valid between {cert.valid_after}-{cert.valid_before})!")
             return False
     
     except InvalidSignature:
-        print("[!] Invalid certificate - wrong signature")
+        print("[!] Client Handler | Invalid certificate - wrong signature")
         return False
     except Exception as e:
-        print(f"[!] Certificate verification error: {e!r}")
+        print(f"[!] Client Handler | Certificate verification error: {e!r}")
         return False
     
 def verify_signature(pubkey: serialization.SSHCertPublicKeyTypes, nonce:bytes, response: bytes) -> bool:
@@ -123,9 +111,9 @@ def verify_signature(pubkey: serialization.SSHCertPublicKeyTypes, nonce:bytes, r
     return False
     
 async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    print("[*] Client connected! Waiting for public key...")
+    print("[*] Client Handler | Client connected! Waiting for public key...", end=" ")
     client_cert_raw = await reader.readline()
-    print("[*] Recieved public key, key length: ", len(client_cert_raw.strip()))
+    print(f"received public key (length: {len(client_cert_raw.strip())})")
     
     try:
         # serialize client certificate
@@ -150,7 +138,7 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             await writer.drain()
             return
         
-        nonce = os.urandom(CHALL_SIZE)
+        nonce = os.urandom(NONCE_SIZE)
         
         writer.write(nonce)
         await writer.drain()
@@ -158,21 +146,159 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         response = await reader.read(1024)
 
         if verify_signature(client_pubkey, nonce, response):
-            print("[*] OK. Gate open")
-            writer.write(b"OK")
-            await writer.drain()
+            outbox = await Outbox.create()
+            loaded_key = ssh.serialize_ssh_public_key(client_pubkey)
+            
+            if await outbox.check_client(loaded_key):
+                await outbox.log(loaded_key)
+                
+                print("[*] Client Handler | OK. Gate open")
+                writer.write(b"OK")
+                await writer.drain()
+                
+            else:
+                print("[*] Client Handler | BANNED!")
+                writer.write(b"BANNED")
+                await writer.drain()
             
         else:
             raise InvalidSignature
         
-    except Exception as e:
-        print(f"[!] Other error: {e}")
+    except InvalidSignature:
+        print(f"[!] Client Handler | Invalid signature")
         writer.write(b"FAIL")
         await writer.drain()
         
-async def main(): 
-    server = await asyncio.start_server(client_handler, "localhost", 2137)    
+async def gate_handler():
+    global PUBKEY
+    with open("crypto/ca_key.pub", "rb") as f:
+        PUBKEY = serialization.load_ssh_public_key(f.read())
+        
+    print("[*] Gate Handler | Starting...")
 
-    await server.serve_forever()
+    await Outbox.cleanup()
+    outbox = await Outbox.create()
+    
+    sync_task = asyncio.create_task(sync_with_api(outbox))
+    setup_task = asyncio.create_task(setup_loop())
+    
+    try:
+        server = await asyncio.start_server(client_handler, "localhost", 2137)    
 
-asyncio.run(main())
+        await server.serve_forever()
+        print("[*] Gate Handler | Waiting for clients...")
+        
+    finally:
+        sync_task.cancel()
+        setup_task.cancel()
+            
+        await outbox.close()
+
+async def sync_with_api(outbox: Outbox):
+    print("[*] Exchanger | Starting...")
+    while True:
+        try:
+            await outbox.push(BULK_PUSH)
+            
+        except Exception as e:
+            print(f"[!] Exchanger | Exception during sync occurred: {e}")
+            
+        await asyncio.sleep(PUSH_INTERVAL)
+
+async def prepare_dbs(db):
+    print("[*] Preparing DBs...", end=" ")
+
+    await db.execute("""
+                     CREATE TABLE IF NOT EXISTS "outbox"
+                     (
+                         id                 TEXT PRIMARY KEY,
+                         client_fingerprint TEXT NOT NULL,
+                         action_type        TEXT NOT NULL CHECK (action_type IN ('entry', 'exit')),
+                         created_at         DATETIME                                                                              DEFAULT CURRENT_TIMESTAMP,
+                         status             TEXT NOT NULL CHECK (status IN ('PENDING', 'PROCESSING', 'FAILED', 'SENT', 'VALERR')) DEFAULT 'PENDING',
+                         next_retry_at      DATETIME,
+                         error_message      TEXT
+                     )""")
+    await db.execute("""
+                     CREATE TABLE IF NOT EXISTS "bans"
+                     (
+                         client_fingerprint BLOB not null
+                             constraint bans_pk primary key
+                     )""")
+
+    await db.commit()
+
+    print("done.")
+
+async def setup():
+    db_file = os.getenv("DB_FILE") or "outbox.db"
+    pubkey_file = os.getenv("PUB_KEY") or "crypto/ca_key.pub"
+    
+    # setup tables
+    db = await aiosqlite.connect(db_file)
+    await prepare_dbs(db)
+
+    # (try to) get pubkey from API, (try to) get ban list from API
+    # get CA pubkey
+    valid_pubkey = False
+
+    print("[*] Retrieving CA's public key from API...", end=" ")
+    pubkey = await Outbox.get_pubkey()
+    if pubkey:
+        try:
+            # if it fails -> pubkey not valid
+            serialization.load_ssh_public_key(base64.b64decode(pubkey))
+            
+            with open(pubkey_file, "wb") as file:
+                file.write(base64.b64decode(pubkey))
+                file.close()
+                
+            valid_pubkey = True   
+            print("done!")
+            
+        except Exception as e:
+            valid_pubkey = False
+            print(f"[!] Cannot save the retrieved key due to errors: {e}. Trying to use existing key...", end=" ")
+            
+    if not valid_pubkey:
+        with open(pubkey_file, "rb") as file:
+            pubkey_raw = file.read()
+            try:
+                serialization.load_ssh_public_key(pubkey_raw)
+                print("[!] Unable to retrieve public key from API, using the old one.")
+            except Exception as e:
+                print("[!] Unable to load any public key due to errors. Quitting...")
+                raise e
+            
+    # get bans
+    print("[*] Retrieving ban list from API...", end=" ")
+    bans = await Outbox.get_bans()
+    if bans:
+        await db.execute("DELETE FROM bans")
+        for ban in bans:
+            await db.execute("INSERT INTO bans VALUES (?)", (ban,))
+
+        await db.commit()
+            
+        print("done!")
+
+    elif bans == []:
+        print("No clients are banned - clearing the bans table...", end=" ")
+
+        await db.execute("DELETE FROM bans")
+        await db.commit()
+            
+        print("done!")
+            
+    else:
+        print("Unable to retrieve banned clients - using the saved list.")
+
+async def setup_loop():
+    while True:
+        await asyncio.sleep(os.getenv("SETUP_INTERVAL") or 86400)
+
+        await setup()
+
+if __name__ == "__main__":
+    asyncio.run(setup())
+    asyncio.run(gate_handler())
