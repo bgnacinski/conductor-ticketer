@@ -37,7 +37,6 @@ with retries, so the gate keeps working while the API is offline.
 | Tool       | Version used | Notes                                          |
 | ---------- | ------------ | ---------------------------------------------- |
 | Python     | 3.14+        | Uses `asyncio` and `aiosqlite`                  |
-| OpenSSH    | 10.x+        | `ssh-keygen` signs card certs (client-side setup) |
 | `pip`      | —            | Installed inside the project virtualenv         |
 
 Python packages (installed with `pip`):
