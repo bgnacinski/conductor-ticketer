@@ -144,14 +144,31 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         await writer.drain()
         
         response = await reader.read(1024)
+        start = time.perf_counter()
 
         if verify_signature(client_pubkey, nonce, response):
             outbox = await Outbox.create()
-            await outbox.log(ssh.serialize_ssh_public_key(client_pubkey))
+            loaded_key = ssh.serialize_ssh_public_key(client_pubkey)
             
-            print("[*] Client Handler | OK. Gate open")
-            writer.write(b"OK")
-            await writer.drain()
+            if await outbox.check_client(loaded_key):
+                await outbox.log(loaded_key)
+                
+                print("[*] Client Handler | OK. Gate open")
+                writer.write(b"OK")
+                await writer.drain()
+
+                # kod do zmierzenia
+                elapsed = time.perf_counter() - start
+                print(f"Czas: {elapsed:.6f} s")
+                
+            else:
+                print("[*] Client Handler | BANNED!")
+                writer.write(b"BANNED")
+                await writer.drain()
+
+                # kod do zmierzenia
+                elapsed = time.perf_counter() - start
+                print(f"Czas: {elapsed:.6f} s")
             
         else:
             raise InvalidSignature
@@ -160,13 +177,17 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         print(f"[!] Client Handler | Invalid signature")
         writer.write(b"FAIL")
         await writer.drain()
+
+        # kod do zmierzenia
+        elapsed = time.perf_counter() - start
+        print(f"Czas: {elapsed:.6f} s")
         
 async def gate_handler():
     global PUBKEY
     with open("crypto/ca_key.pub", "rb") as f:
         PUBKEY = serialization.load_ssh_public_key(f.read())
         
-    print("Gate Handler | Starting...")
+    print("[*] Gate Handler | Starting...")
 
     await Outbox.cleanup()
     outbox = await Outbox.create()
@@ -177,7 +198,7 @@ async def gate_handler():
         server = await asyncio.start_server(client_handler, "localhost", 2137)    
 
         await server.serve_forever()
-        print("Gate Handler | Waiting for clients...")
+        print("[*] Gate Handler | Waiting for clients...")
         
     finally:
         sync_task.cancel()
@@ -185,7 +206,7 @@ async def gate_handler():
         await outbox.close()
     
 async def sync_with_api(outbox: Outbox):
-    print("Exchanger | Starting...")
+    print("[*] Exchanger | Starting...")
     while True:
         try:
             await outbox.push(BULK_PUSH)
@@ -196,12 +217,33 @@ async def sync_with_api(outbox: Outbox):
         await asyncio.sleep(PUSH_INTERVAL)
 
 def setup():
-    # setup tables
+    db_file = os.getenv("DB_FILE") or "outbox.db"
+    pubkey_file = os.getenv("PUB_KEY") or "crypto/ca_key.pub"
     
+    # setup tables
+    print("[*] Preparing DBs...", end=" ")
+    with sqlite3.connect(db_file) as db:
+        db.execute("""
+CREATE TABLE IF NOT EXISTS "outbox" (
+    id TEXT PRIMARY KEY,
+    client_fingerprint TEXT NOT NULL,
+    action_type TEXT NOT NULL CHECK (action_type IN ('entry', 'exit')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'PROCESSING', 'FAILED', 'SENT', 'VALERR')) DEFAULT 'PENDING',
+    next_retry_at DATETIME,
+    error_message TEXT
+)""")
+        db.execute("""
+CREATE TABLE IF NOT EXISTS "bans"
+(
+    client_fingerprint BLOB not null constraint bans_pk primary key
+)""")
+        db.commit()
+        
+    print("done.")
     
     # (try to) get pubkey from API, (try to) get ban list from API
     # get CA pubkey
-    pubkey_file = os.getenv("PUB_KEY") or "crypto/ca_key.pub"
     valid_pubkey = False
 
     print("[*] Retrieving CA's public key from API...", end=" ")
@@ -233,7 +275,6 @@ def setup():
                 raise e
             
     # get bans
-    db_file = os.getenv("DB_FILE") or "outbox.db"
     print("[*] Retrieving ban list from API...", end=" ")
     bans = Outbox.get_bans()
     if bans:
@@ -257,6 +298,6 @@ def setup():
     else:
         print("Unable to retrieve banned clients - using the saved list.")
         
-
-setup()
-asyncio.run(gate_handler())
+if __name__ == "__main__":
+    setup()
+    asyncio.run(gate_handler())

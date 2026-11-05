@@ -70,7 +70,7 @@ class Outbox:
 
     @staticmethod
     def get_pubkey():
-        url = os.getenv("API_URL") + "pubkey" or "http://localhost/api/pubkey"
+        url = (os.getenv("API_URL") or "http://localhost/api/") + "pubkey"
         api_key = os.getenv("API_KEY") or ""
 
         headers = {
@@ -90,7 +90,7 @@ class Outbox:
 
     @staticmethod
     def get_bans():
-        url = os.getenv("API_URL") + "bans" or "http://localhost/api/bans"
+        url = (os.getenv("API_URL") or "http://localhost/api/") + "bans"
         api_key = os.getenv("API_KEY") or ""
 
         headers = {
@@ -110,9 +110,25 @@ class Outbox:
 
         else:
             return None
+        
+    async def check_client(self, client_id: bytes) -> bool:
+        client_fingerprint = hashlib.sha256(client_id).hexdigest()
+
+        cursor = await self.db.execute(
+            "SELECT client_fingerprint FROM bans WHERE client_fingerprint = ?",
+            (client_fingerprint,),
+        )
+
+        if await cursor.fetchone():
+            await cursor.close()
+            return False
+        
+        else:
+            await cursor.close()
+            return True
 
     async def push(self, bulk:bool=True):
-        url = os.getenv("API_URL") + "/log" or "http://localhost/api/log"
+        url = (os.getenv("API_URL") or "http://localhost/api/") + "log"
         api_key = os.getenv("API_KEY") or ""
         headers = {
             "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
