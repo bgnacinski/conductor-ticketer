@@ -9,7 +9,6 @@ import os
 
 class Outbox:
     db: aiosqlite.Connection
-    gate_id = os.getenv("GATE_ID") or "UNKNOWN"
     batch_size = int(os.getenv("BATCH_SIZE") or 500)
      
     def __init__(self, db: aiosqlite.Connection):
@@ -68,13 +67,57 @@ class Outbox:
     def _next_retry(self, base: float = 5, cap: float = 900) -> str:
         delay = random.uniform(0, min(base * 2, cap))
         return (datetime.now(timezone.utc) + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def get_pubkey():
+        url = os.getenv("API_URL") + "pubkey" or "http://localhost/api/pubkey"
+        api_key = os.getenv("API_KEY") or ""
+
+        headers = {
+            "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        res = httpx.get(url, headers=headers)
+        res_data = res.json()
+
+        if res.is_success:
+            return res_data["data"]
+
+        else:
+            return None
+
+    @staticmethod
+    def get_bans():
+        url = os.getenv("API_URL") + "bans" or "http://localhost/api/bans"
+        api_key = os.getenv("API_KEY") or ""
+
+        headers = {
+            "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        res = httpx.get(url, headers=headers, params={"output_type": "list"})
+        res_data = res.json()
         
+        if res.is_success and res_data["status"] == "success":
+            return res_data["data"]
+
+        elif res.is_success and res_data["status"] == "nodata":
+            return []
+
+        else:
+            return None
+
     async def push(self, bulk:bool=True):
-        url = os.getenv("API_PUSH_URL") or "http://localhost/api/push"
+        url = os.getenv("API_URL") + "/log" or "http://localhost/api/log"
         api_key = os.getenv("API_KEY") or ""
         headers = {
-            "User-Agent": "Ticketer/0.0.1",
-            "Authorization": f"Bearer {api_key}"
+            "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
         }
         req_schema = {
             "bulk": bulk,
@@ -128,7 +171,6 @@ class Outbox:
                             await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({placeholders})", (*batch_ids,))
                             await self.db.commit()
                             print(f"[*] Exchanger | Successful API push of {len(batch_ids)}/{len(ids_to_send)} elements")
-                            # USUNąĆ wysłane elementy z ids_to_send
                             unsent.difference_update(batch_ids)
                             
                         elif res.status_code == 207:

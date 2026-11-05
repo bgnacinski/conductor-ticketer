@@ -1,8 +1,7 @@
-GATE_ID=M1_1
 GATE_TYPE= #entry/exit
 NONCE_SIZE=32
 DB_FILE=db/outbox.db
-API_PUSH_URL=http://localhost:8080/api/push
+API_URL=http://localhost:8080/api/
 API_KEY=
 BULK_PUSH=false
 PUSH_INTERVAL=1800
