@@ -69,7 +69,7 @@ class Outbox:
         return (datetime.now(timezone.utc) + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
-    def get_pubkey():
+    async def get_pubkey():
         url = (os.getenv("API_URL") or "http://localhost/api/") + "pubkey"
         api_key = os.getenv("API_KEY") or ""
 
@@ -79,17 +79,18 @@ class Outbox:
             "Content-Type": "application/json"
         }
 
-        res = httpx.get(url, headers=headers)
-        res_data = res.json()
+        async with httpx.AsyncClient(headers=headers) as client:
+            res = await client.get(url, headers=headers)
+            res_data = res.json()
 
-        if res.is_success:
-            return res_data["data"]
+            if res.is_success:
+                return res_data["data"]
 
-        else:
-            return None
+            else:
+                return None
 
     @staticmethod
-    def get_bans():
+    async def get_bans():
         url = (os.getenv("API_URL") or "http://localhost/api/") + "bans"
         api_key = os.getenv("API_KEY") or ""
 
@@ -99,17 +100,18 @@ class Outbox:
             "Content-Type": "application/json"
         }
 
-        res = httpx.get(url, headers=headers, params={"output_type": "list"})
-        res_data = res.json()
-        
-        if res.is_success and res_data["status"] == "success":
-            return res_data["data"]
+        async with httpx.AsyncClient(headers=headers) as client:
+            res = await client.get(url, headers=headers, params={"output_type": "list"})
+            res_data = res.json()
 
-        elif res.is_success and res_data["status"] == "nodata":
-            return []
+            if res.is_success and res_data["status"] == "success":
+                return res_data["data"]
 
-        else:
-            return None
+            elif res.is_success and res_data["status"] == "nodata":
+                return []
+
+            else:
+                return None
         
     async def check_client(self, client_id: bytes) -> bool:
         client_fingerprint = hashlib.sha256(client_id).hexdigest()

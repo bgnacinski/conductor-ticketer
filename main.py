@@ -3,7 +3,7 @@ from cryptography.hazmat.primitives.serialization import ssh
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, ec, padding
 from cryptography.exceptions import InvalidSignature 
 from Exchanger import Outbox
-import sqlite3
+import aiosqlite
 import base64
 import asyncio
 import time
@@ -111,9 +111,9 @@ def verify_signature(pubkey: serialization.SSHCertPublicKeyTypes, nonce:bytes, r
     return False
     
 async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    print("[*] Client Handler | Client connected! Waiting for public key...")
+    print("[*] Client Handler | Client connected! Waiting for public key...", end=" ")
     client_cert_raw = await reader.readline()
-    print("[*] Client Handler | Recieved public key, key length: ", len(client_cert_raw.strip()))
+    print(f"received public key (length: {len(client_cert_raw.strip())})")
     
     try:
         # serialize client certificate
@@ -144,7 +144,6 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         await writer.drain()
         
         response = await reader.read(1024)
-        start = time.perf_counter()
 
         if verify_signature(client_pubkey, nonce, response):
             outbox = await Outbox.create()
@@ -156,19 +155,11 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 print("[*] Client Handler | OK. Gate open")
                 writer.write(b"OK")
                 await writer.drain()
-
-                # kod do zmierzenia
-                elapsed = time.perf_counter() - start
-                print(f"Czas: {elapsed:.6f} s")
                 
             else:
                 print("[*] Client Handler | BANNED!")
                 writer.write(b"BANNED")
                 await writer.drain()
-
-                # kod do zmierzenia
-                elapsed = time.perf_counter() - start
-                print(f"Czas: {elapsed:.6f} s")
             
         else:
             raise InvalidSignature
@@ -177,10 +168,6 @@ async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         print(f"[!] Client Handler | Invalid signature")
         writer.write(b"FAIL")
         await writer.drain()
-
-        # kod do zmierzenia
-        elapsed = time.perf_counter() - start
-        print(f"Czas: {elapsed:.6f} s")
         
 async def gate_handler():
     global PUBKEY
@@ -193,6 +180,7 @@ async def gate_handler():
     outbox = await Outbox.create()
     
     sync_task = asyncio.create_task(sync_with_api(outbox))
+    setup_task = asyncio.create_task(setup_loop())
     
     try:
         server = await asyncio.start_server(client_handler, "localhost", 2137)    
@@ -202,9 +190,10 @@ async def gate_handler():
         
     finally:
         sync_task.cancel()
+        setup_task.cancel()
             
         await outbox.close()
-    
+
 async def sync_with_api(outbox: Outbox):
     print("[*] Exchanger | Starting...")
     while True:
@@ -212,42 +201,49 @@ async def sync_with_api(outbox: Outbox):
             await outbox.push(BULK_PUSH)
             
         except Exception as e:
-            print(f"[!] Exchanger | Exception during sync occured: {e}")
+            print(f"[!] Exchanger | Exception during sync occurred: {e}")
             
         await asyncio.sleep(PUSH_INTERVAL)
 
-def setup():
+async def prepare_dbs(db):
+    print("[*] Preparing DBs...", end=" ")
+
+    await db.execute("""
+                     CREATE TABLE IF NOT EXISTS "outbox"
+                     (
+                         id                 TEXT PRIMARY KEY,
+                         client_fingerprint TEXT NOT NULL,
+                         action_type        TEXT NOT NULL CHECK (action_type IN ('entry', 'exit')),
+                         created_at         DATETIME                                                                              DEFAULT CURRENT_TIMESTAMP,
+                         status             TEXT NOT NULL CHECK (status IN ('PENDING', 'PROCESSING', 'FAILED', 'SENT', 'VALERR')) DEFAULT 'PENDING',
+                         next_retry_at      DATETIME,
+                         error_message      TEXT
+                     )""")
+    await db.execute("""
+                     CREATE TABLE IF NOT EXISTS "bans"
+                     (
+                         client_fingerprint BLOB not null
+                             constraint bans_pk primary key
+                     )""")
+
+    await db.commit()
+
+    print("done.")
+
+async def setup():
     db_file = os.getenv("DB_FILE") or "outbox.db"
     pubkey_file = os.getenv("PUB_KEY") or "crypto/ca_key.pub"
     
     # setup tables
-    print("[*] Preparing DBs...", end=" ")
-    with sqlite3.connect(db_file) as db:
-        db.execute("""
-CREATE TABLE IF NOT EXISTS "outbox" (
-    id TEXT PRIMARY KEY,
-    client_fingerprint TEXT NOT NULL,
-    action_type TEXT NOT NULL CHECK (action_type IN ('entry', 'exit')),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    status TEXT NOT NULL CHECK (status IN ('PENDING', 'PROCESSING', 'FAILED', 'SENT', 'VALERR')) DEFAULT 'PENDING',
-    next_retry_at DATETIME,
-    error_message TEXT
-)""")
-        db.execute("""
-CREATE TABLE IF NOT EXISTS "bans"
-(
-    client_fingerprint BLOB not null constraint bans_pk primary key
-)""")
-        db.commit()
-        
-    print("done.")
-    
+    db = await aiosqlite.connect(db_file)
+    await prepare_dbs(db)
+
     # (try to) get pubkey from API, (try to) get ban list from API
     # get CA pubkey
     valid_pubkey = False
 
     print("[*] Retrieving CA's public key from API...", end=" ")
-    pubkey = Outbox.get_pubkey()
+    pubkey = await Outbox.get_pubkey()
     if pubkey:
         try:
             # if it fails -> pubkey not valid
@@ -258,7 +254,7 @@ CREATE TABLE IF NOT EXISTS "bans"
                 file.close()
                 
             valid_pubkey = True   
-            print("Successfully retrieved CA's public key!")
+            print("done!")
             
         except Exception as e:
             valid_pubkey = False
@@ -276,28 +272,33 @@ CREATE TABLE IF NOT EXISTS "bans"
             
     # get bans
     print("[*] Retrieving ban list from API...", end=" ")
-    bans = Outbox.get_bans()
+    bans = await Outbox.get_bans()
     if bans:
-        with sqlite3.connect(db_file) as db:
-            db.execute("DELETE FROM bans")
-            for ban in bans:
-                db.execute("INSERT INTO bans VALUES (?)", (ban,))
+        await db.execute("DELETE FROM bans")
+        for ban in bans:
+            await db.execute("INSERT INTO bans VALUES (?)", (ban,))
 
-            db.commit()
+        await db.commit()
             
-            print("Successfully retrieved ban list from API!")
+        print("done!")
+
     elif bans == []:
         print("No clients are banned - clearing the bans table...", end=" ")
-        
-        with sqlite3.connect(db_file) as db:
-            db.execute("DELETE FROM bans")
-            db.commit()
+
+        await db.execute("DELETE FROM bans")
+        await db.commit()
             
-        print("Bans table cleared!")
+        print("done!")
             
     else:
         print("Unable to retrieve banned clients - using the saved list.")
-        
+
+async def setup_loop():
+    while True:
+        await asyncio.sleep(os.getenv("SETUP_INTERVAL") or 86400)
+
+        await setup()
+
 if __name__ == "__main__":
-    setup()
+    asyncio.run(setup())
     asyncio.run(gate_handler())
