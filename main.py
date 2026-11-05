@@ -10,8 +10,9 @@ import time
 import os
 
 BULK_PUSH = str(os.getenv("BULK_PUSH")).lower() in ("true", "yes")
-PUSH_INTERVAL = int(str(os.getenv("PUSH_INTERVAL"))) or 1800
-NONCE_SIZE = int(str(os.getenv("NONCE_SIZE"))) or 16
+PUSH_INTERVAL = int(os.getenv("PUSH_INTERVAL") or 1800)
+SETUP_INTERVAL = int(os.getenv("SETUP_INTERVAL")or 86400)
+NONCE_SIZE = int(os.getenv("NONCE_SIZE") or 16)
 MIN_RSA_KEY_SIZE = 2048
 MIN_ECDSA_KEY_SIZE = 256
 ALLOWED_KEY_TYPES = [
@@ -295,7 +296,7 @@ async def setup():
 
 async def setup_loop():
     while True:
-        await asyncio.sleep(os.getenv("SETUP_INTERVAL") or 86400)
+        await asyncio.sleep(SETUP_INTERVAL)
 
         await setup()
 
