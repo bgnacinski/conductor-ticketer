@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from math import ceil
+import Repositories
 import aiosqlite
 import random
 import hashlib
@@ -8,46 +9,14 @@ import uuid
 import os
 
 class Outbox:
-    db: aiosqlite.Connection
-    batch_size = int(os.getenv("BATCH_SIZE") or 500)
+    _log_repository: Repositories.LogRepository
+    _ban_repository: Repositories.BanRepository
+    batch_size: int
      
-    def __init__(self, db: aiosqlite.Connection):
-        self.db = db
-        self.db.row_factory = aiosqlite.Row
-
-    @classmethod
-    async def create(cls) -> "Outbox":
-        db_file = os.getenv("DB_FILE") or "db/outbox.db"
-
-        try:
-            conn = await aiosqlite.connect(db_file)
-
-            await conn.execute("PRAGMA journal_mode = WAL;")
-            await conn.execute("PRAGMA synchronous = FULL;")
-            await conn.execute("PRAGMA wal_checkpoint(FULL);")
-
-            return cls(db=conn)
-
-        except aiosqlite.OperationalError:
-            print(f"[!] Cannot open database from: {db_file}")
-            raise
-        
-    @staticmethod
-    async def cleanup() -> None:
-        db_file = os.getenv("DB_FILE") or "db/outbox.db"
-        
-        try:
-            conn = await aiosqlite.connect(db_file)
-        
-            await conn.execute("UPDATE outbox SET status='PENDING' WHERE status='PROCESSING'")
-            await conn.execute("DELETE FROM outbox WHERE status='SENT'")
-            await conn.commit()
-            
-            await conn.close()
-            
-        except aiosqlite.OperationalError:
-            print(f"[!] Cannot open database from: {db_file}")
-            raise
+    def __init__(self, log_repository: Repositories.LogRepository, ban_repository: Repositories.BanRepository, batch_size: int = 500):
+        self._log_repository = log_repository
+        self._ban_repository = ban_repository
+        self._batch_size = batch_size
         
     async def log(self, client_id:bytes):
         """Logs the entry, preparing it for further exchange with the API
@@ -66,53 +35,8 @@ class Outbox:
         
     def _next_retry(self, base: float = 5, cap: float = 900) -> str:
         delay = random.uniform(0, min(base * 2, cap))
-        return (datetime.now(timezone.utc) + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+        return (datetime.now(timezone.utc) + timedelta(minutes=delay)).strftime("%Y-%m-%d %H:%M:%S")
 
-    @staticmethod
-    async def get_pubkey():
-        url = (os.getenv("API_URL") or "http://localhost/api/") + "pubkey"
-        api_key = os.getenv("API_KEY") or ""
-
-        headers = {
-            "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-        async with httpx.AsyncClient(headers=headers) as client:
-            res = await client.get(url, headers=headers)
-            res_data = res.json()
-
-            if res.is_success:
-                return res_data["data"]
-
-            else:
-                return None
-
-    @staticmethod
-    async def get_bans():
-        url = (os.getenv("API_URL") or "http://localhost/api/") + "bans"
-        api_key = os.getenv("API_KEY") or ""
-
-        headers = {
-            "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-        async with httpx.AsyncClient(headers=headers) as client:
-            res = await client.get(url, headers=headers, params={"output_type": "list"})
-            res_data = res.json()
-
-            if res.is_success and res_data["status"] == "success":
-                return res_data["data"]
-
-            elif res.is_success and res_data["status"] == "nodata":
-                return []
-
-            else:
-                return None
-        
     async def check_client(self, client_id: bytes) -> bool:
         client_fingerprint = hashlib.sha256(client_id).hexdigest()
 
@@ -124,7 +48,7 @@ class Outbox:
         if await cursor.fetchone():
             await cursor.close()
             return False
-        
+
         else:
             await cursor.close()
             return True
@@ -186,6 +110,7 @@ class Outbox:
                         response = res.json()
                         
                         if res.status_code in (200, 201):
+
                             await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({placeholders})", (*batch_ids,))
                             await self.db.commit()
                             print(f"[*] Exchanger | Successful API push of {len(batch_ids)}/{len(ids_to_send)} elements")
