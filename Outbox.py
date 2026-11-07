@@ -1,64 +1,40 @@
-from datetime import datetime, timedelta, timezone
 from math import ceil
 import Repositories
-import aiosqlite
-import random
-import hashlib
 import httpx
-import uuid
 import os
 
 class Outbox:
     _log_repository: Repositories.LogRepository
-    _ban_repository: Repositories.BanRepository
+    _base_url: str
+    _api_key: str
     batch_size: int
      
-    def __init__(self, log_repository: Repositories.LogRepository, ban_repository: Repositories.BanRepository, batch_size: int = 500):
+    def __init__(self, base_url:str, api_key:str, log_repository: Repositories.LogRepository, batch_size: int = 500):
+        self._base_url = base_url
+        self._api_key = api_key
+
         self._log_repository = log_repository
-        self._ban_repository = ban_repository
-        self._batch_size = batch_size
-        
-    async def log(self, client_id:bytes):
-        """Logs the entry, preparing it for further exchange with the API
+        self.batch_size = batch_size
 
-        Args:
-            client_id (bytes): Serialized client public key
-        """
-        fingerprint = hashlib.sha256(client_id).hexdigest()
-        action_uuid = str(uuid.uuid4())
-        action_type = os.getenv("GATE_TYPE") or "exit" # if gate is an exit type by default - by default client wont get chareged
-        
-        await self.db.execute("INSERT INTO outbox(id, client_fingerprint, action_type) VALUES (?, ?, ?)",
-            (action_uuid, fingerprint, action_type))
-        
-        await self.db.commit()
-        
-    def _next_retry(self, base: float = 5, cap: float = 900) -> str:
-        delay = random.uniform(0, min(base * 2, cap))
-        return (datetime.now(timezone.utc) + timedelta(minutes=delay)).strftime("%Y-%m-%d %H:%M:%S")
+    def _map_log_to_json(self, data:tuple) -> list:
+        res = []
+        for row in data:
+            json_fragment = {
+                "id": row[0],
+                "client_fingerprint": row[1],
+                "action_type": row[2],
+                "created_at": row[3]
+            }
 
-    async def check_client(self, client_id: bytes) -> bool:
-        client_fingerprint = hashlib.sha256(client_id).hexdigest()
+            res.append(json_fragment)
 
-        cursor = await self.db.execute(
-            "SELECT client_fingerprint FROM bans WHERE client_fingerprint = ?",
-            (client_fingerprint,),
-        )
-
-        if await cursor.fetchone():
-            await cursor.close()
-            return False
-
-        else:
-            await cursor.close()
-            return True
+        return res
 
     async def push(self, bulk:bool=True):
-        url = (os.getenv("API_URL") or "http://localhost/api/") + "log"
-        api_key = os.getenv("API_KEY") or ""
+        url = self._base_url + "log"
         headers = {
             "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json"
         }
         req_schema = {
@@ -66,43 +42,35 @@ class Outbox:
             "data": []
         }
         
-        data_to_send = await self.db.execute_fetchall("""UPDATE outbox SET status = 'PROCESSING'
-                WHERE (status = 'PENDING')
-                OR (status = 'FAILED' AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP))
-                RETURNING id, client_fingerprint, action_type, created_at""")
-        
-        await self.db.commit()
-        
+        data_to_send = await self._log_repository.prepare_api_push()
         if not data_to_send:
             return
-        
+
         ids_to_send = []
         for row in data_to_send:
             ids_to_send.append(row[0])
         
         data_to_send = tuple(data_to_send)
         unsent = set(ids_to_send)
-        
-        try:
-            if bulk: # sending data in bulk - tries to send all of the elements at once
-                no_batches = int(ceil(len(data_to_send) / self.batch_size))
-                
-                for i in range(1, no_batches+1):
-                    batch_data = data_to_send[self.batch_size * (i-1) : self.batch_size * i]
-                    batch_ids = ids_to_send[self.batch_size * (i-1) : self.batch_size * i]
-                    placeholders = ",".join("?" * len(batch_ids))
-                        
-                    req_schema["data"] = [dict(r) for r in batch_data]
+
+        async with httpx.AsyncClient() as client:
+            try:
+                if bulk: # sending data in bulk - tries to send all of the elements at once
+                    no_batches = int(ceil(len(data_to_send) / self.batch_size))
+
+                    for i in range(0, no_batches):
+                        batch_data = data_to_send[self.batch_size * i : self.batch_size * (i+1)]
+                        batch_ids = ids_to_send[self.batch_size * i : self.batch_size * (i+1)]
+
+                        req_schema["data"] = self._map_log_to_json(batch_data)
                     
-                    async with httpx.AsyncClient() as client:
+                        print("sending request")
                         try:
                             res = await client.post(url, headers=headers, json=req_schema)
                             
                         except httpx.TransportError:
                             print("[!] Exchanger | Unable to connect to the API - aborting")
-                            await self.db.execute(f"UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id IN ({placeholders})", ("CONN_ERR", self._next_retry(), *batch_ids))
-                            await self.db.commit()
-                            
+                            await self._log_repository.update_status(batch_ids, "FAILED")
                             unsent.difference_update(batch_ids)
                             
                             return
@@ -110,9 +78,9 @@ class Outbox:
                         response = res.json()
                         
                         if res.status_code in (200, 201):
-
-                            await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({placeholders})", (*batch_ids,))
-                            await self.db.commit()
+                            result = await self._log_repository.update_status(batch_ids, "SENT")
+                            if not result:
+                                print("[!] Due to errors, database state may not reflect changes made by API push")
                             print(f"[*] Exchanger | Successful API push of {len(batch_ids)}/{len(ids_to_send)} elements")
                             unsent.difference_update(batch_ids)
                             
@@ -123,15 +91,15 @@ class Outbox:
                             
                             saved_ids = created + duplicates
                             if len(saved_ids) > 0:
-                                saved_placeholders = ",".join("?" * len(saved_ids))
-                                await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({saved_placeholders})", (*saved_ids,))
-                                      
+                                result = await self._log_repository.update_status(saved_ids, "SENT")
+                                if not result:
+                                    print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
                             if len(failed) > 0:
-                                fail_placeholders = ",".join("?" * len(failed))
-                                await self.db.execute(f"UPDATE outbox SET status='VALERR' WHERE id IN ({fail_placeholders})", (*failed,))
-                            
-                            await self.db.commit()
-                            
+                                result = await self._log_repository.update_status(failed, "VALERR")
+                                if not result:
+                                    print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
                             unsent.difference_update(duplicates, created, failed)
                             
                             print(f"[*] Exchanger | Multi-Status response received. Created elements: {len(created)}, duplicate elements: {len(duplicates)}, failed elements: {len(failed)}")
@@ -139,9 +107,10 @@ class Outbox:
                     
                         elif res.status_code // 100 == 5:
                             print("[!] Exchanger | API Server HTTP error: ", res.status_code, ". Unable to push data")
-                            await self.db.execute(f"UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id IN ({placeholders})", (res.status_code, self._next_retry(), *batch_ids))
-                            await self.db.commit()
-                            
+                            result = await self._log_repository.retard_sync(batch_ids)
+                            if not result:
+                                print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
                             unsent.difference_update(batch_ids)
                             
                             return
@@ -149,39 +118,41 @@ class Outbox:
                         elif res.status_code // 100 == 4:                                                   
                             if res.status_code in (401, 403):
                                 print("[!] Exchanger | Authentication failure - unable to push data. HTTP ", res.status_code)
-                                await self.db.execute(f"UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id IN ({placeholders})", (res.status_code, self._next_retry(), *batch_ids))
-                                await self.db.commit()
-                                
+
+                                result = await self._log_repository.retard_sync(batch_ids)
+                                if not result:
+                                    print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
                                 unsent.difference_update(batch_ids)
-                                
+
                                 return
                             
                             elif res.status_code == 409:
                                 duplicates = response["duplicates"]
-                                dup_placeholders = ", ".join("?" * len(duplicates))
-                                
+
                                 print(f"[*] Exchanger | Marking {len(duplicates)} duplicate elements as SENT")
-                            
-                                await self.db.execute(f"UPDATE outbox SET status='SENT' WHERE id IN ({dup_placeholders})", (*duplicates,))
-                                await self.db.commit()
-                            
+
+                                result = await self._log_repository.update_status(duplicates, "SENT")
+                                if not result:
+                                    print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
                                 unsent.difference_update(duplicates)
                                 
                             elif res.status_code == 422:
                                 failed_ids = response["failed"]
-                                
-                                fail_placeholders = ", ".join("?" * len(failed_ids))
-                                
+
                                 print(f"[!] Exchanger | HTTP 422 - Permanently removing {len(failed_ids)} from queue due to validation errors.")
-                                await self.db.execute(f"UPDATE outbox SET status='VALERR' WHERE id IN ({fail_placeholders})", (*failed_ids, ))
-                                await self.db.commit()
-                                
+                                result = await self._log_repository.update_status(failed_ids, "VALERR")
+                                if not result:
+                                    print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
                                 unsent.difference_update(failed_ids)
                 
                             elif res.status_code == 429:
                                 print("[!] Exchanger | HTTP 429 - API server is probably overloaded. Aborting data push")
-                                await self.db.execute(f"UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id IN ({placeholders})", (res.status_code, self._next_retry(), *batch_ids))
-                                await self.db.commit()
+                                result = await self._log_repository.retard_sync(batch_ids)
+                                if not result:
+                                    print("[!] Due to errors, database state may not reflect changes requested by the API response")
                                 
                                 unsent.difference_update(batch_ids)
                                 
@@ -189,76 +160,75 @@ class Outbox:
                     
                             else:
                                 print(f"[!] Exchanger | HTTP {res.status_code} error")
-                                await self.db.execute(f"UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id IN ({placeholders})", (res.status_code, self._next_retry(), *batch_ids))
-                                await self.db.commit()
+                                result = await self._log_repository.retard_sync(batch_ids)
+                                if not result:
+                                    print("[!] Due to errors, database state may not reflect changes requested by the API response")
                                 
                                 unsent.difference_update(batch_ids)
                 
-            else:
-                async with httpx.AsyncClient() as client:
+                else:
                     for row in data_to_send:
-                        req_schema["data"] = dict(row)
+                        req_schema["data"] = list(row)
+                        row_id = row[0]
                     
                         try:
                             res = await client.post(url, headers=headers, json=req_schema)
                             
                         except httpx.TransportError:
                             print("[!] Exchanger | Unable to connect to the API - aborting")
-                            await self.db.execute(f"UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id = ?", ("CONN_ERR", self._next_retry(), row[0]))
-                            await self.db.commit()
-                            unsent.discard(row[0])
+                            result = await self._log_repository.retard_sync([row_id])
+                            if not result:
+                                print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
+                            unsent.discard(row_id)
                             
                             return
                         
                         if res.is_success:
-                            row_id = row[0]
-                            
-                            await self.db.execute("UPDATE outbox SET status='SENT' WHERE id = ?", (row_id,))
-                            await self.db.commit()
-                            
+                            result = await self._log_repository.update_status([row_id], "SENT")
+                            if not result:
+                                print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
                             unsent.discard(row_id)
                             
                             print(f"[*] Exchanger | Successful API push of element {row_id}")
                         
                         elif res.status_code // 100 == 5:
                             print("[!] Exchanger | API Server HTTP error: ", res.status_code, ". Unable to push data")
-                            await self.db.execute("UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id=?", (res.status_code, self._next_retry(), row[0]))
-                            await self.db.commit()
-                            unsent.discard(row[0])
-                            
+
+                            result = await self._log_repository.update_status([row_id], "FAILED")
+                            if not result:
+                                print("[!] Due to errors, database state may not reflect changes requested by the API response")
+
+                            unsent.discard(row_id)
                             return
                             
                         elif res.status_code // 100 == 4:
+                            result = await self._log_repository.update_status([row_id], "FAILED")
+                            if not result:
+                                print(
+                                    "[!] Due to errors, database state may not reflect changes requested by the API response")
+
+                            unsent.discard(row_id)
+
                             if res.status_code in (401, 403):
                                 print("[!] Exchanger | Authentication failure - unable to push data. HTTP ", res.status_code)
-                                await self.db.execute("UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id=?", (res.status_code, self._next_retry(), row[0],))
-                                await self.db.commit()
-                                
-                                unsent.discard(row[0])
-                                
+
                                 return
                                 
                             elif res.status_code == 429:
                                 print("[!] Exchanger | HTTP 429 - API server is probably overloaded. Aborting data push")
-                                await self.db.execute("UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id=?", (res.status_code, self._next_retry(), row[0],))
-                                await self.db.commit()
-                                
-                                unsent.discard(row[0])
                                 return
                             
                             else:
                                 print(f"[!] Exchanger | HTTP {res.status_code} error")
-                                await self.db.execute("UPDATE outbox SET status='FAILED', error_message=?, next_retry_at=? WHERE id=?", (res.status_code, self._next_retry(), row[0],))
-                                await self.db.commit()
-                                
-                                unsent.discard(row[0])
-                            
-        finally:
-            if unsent:
-                ids = list(unsent)
-                placeholders = ",".join("?" * len(ids))
-                await self.db.execute(f"UPDATE outbox SET status='PENDING' WHERE id in ({placeholders})", ids)
-                await self.db.commit()
-                    
-    async def close(self):
-        await self.db.close()
+
+            finally:
+                if unsent:
+                    ids = list(unsent)
+                    result = await self._log_repository.update_status(ids, "PENDING")
+
+                    if not result:
+                        print("[!] Outbox table is left in an unstable state!")
+
+        await self._log_repository.cleanup()

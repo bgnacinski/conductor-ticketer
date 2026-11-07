@@ -1,16 +1,20 @@
-import Repositories
+from cryptography.hazmat.primitives import serialization
+from Repositories import BanRepository
+import base64
 import httpx
 import os
 
 class Inbox:
-    _ban_repository: Repositories.BanRepository
+    _ban_repository: BanRepository
     _base_url: str
     _api_key: str
+    _ca_public_key_file: str
 
-    def __init__(self, ban_repository: Repositories.BanRepository, base_url: str, api_key: str):
-        self._ban_repository = ban_repository
+    def __init__(self, base_url: str, api_key: str, ban_repository: BanRepository, ca_public_key_file: str):
         self._base_url = base_url
         self._api_key = api_key
+        self._ban_repository = ban_repository
+        self._ca_public_key_file = ca_public_key_file
 
     async def fetch_pubkey(self):
         headers = {
@@ -21,17 +25,51 @@ class Inbox:
 
         url = self._base_url + "pubkey"
 
-        async with httpx.AsyncClient(headers=headers) as client:
-            res = await client.get(url, headers=headers)
-            res_data = res.json()
+        valid_pubkey = False
 
-            if res.is_success:
-                return res_data["data"]
+        try:
+            async with httpx.AsyncClient(headers=headers) as client:
+                res = await client.get(url)
+                res_data = res.json()
 
-            else:
-                return None
+                if res.is_success:
+                    try:
+                        pubkey = base64.b64decode(res_data["data"])
+                        # if it fails -> pubkey not valid
+                        serialization.load_ssh_public_key(pubkey)
 
-    async def fetch_bans(self):
+                        with open(self._ca_public_key_file, "wb") as file:
+                            file.write(pubkey)
+                            file.close()
+
+                        valid_pubkey = True
+                        print("done!")
+
+                        return True
+
+                    except Exception as e:
+                        valid_pubkey = False
+                        print(f"[!] Cannot save the retrieved key due to errors: {e}. Trying to use existing key...",
+                              end=" ")
+
+        except Exception as e:
+            print(f"An error during API querying occurred: {e}")
+
+        if not valid_pubkey:
+            with open(self._ca_public_key_file, "rb") as file:
+                pubkey_raw = file.read()
+                try:
+                    serialization.load_ssh_public_key(pubkey_raw)
+                    print("[!] Unable to retrieve public key from API, using the old one.")
+                    return True
+
+                except Exception as e:
+                    print("[!] Unable to load any public key due to errors. Quitting...")
+                    raise e
+
+        return False
+
+    async def fetch_bans(self) -> bool:
         headers = {
             "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
             "Authorization": f"Bearer {self._api_key}",
@@ -39,16 +77,25 @@ class Inbox:
         }
         url = self._base_url + "bans"
 
-        async with httpx.AsyncClient(headers=headers) as client:
-            res = await client.get(url, headers=headers, params={"output_type": "list"})
-            res_data = res.json()
+        try:
+            async with httpx.AsyncClient(headers=headers) as client:
+                res = await client.get(url, params={"output_type": "list"})
+                res_data = res.json()
 
-            if res.is_success and res_data["status"] == "success":
-                return res_data["data"]
+                if res.is_success:
+                    await self._ban_repository.clear_bans()
 
-            elif res.is_success and res_data["status"] == "nodata":
-                return []
+                    if res_data["status"] == "success":
+                        await self._ban_repository.ban_bulk(res_data["data"])
 
-            else:
-                return None
+                    print("done!")
+                    return True
 
+                else:
+                    print("Not done!")
+                    return False
+
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+        return False

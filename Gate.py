@@ -1,9 +1,9 @@
 from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.serialization import ssh
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa, ec, padding
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from Repositories import BanRepository, LogRepository
 from Outbox import Outbox
-from Inbox import Inbox
+import hashlib
 import time
 import asyncio
 import os
@@ -12,6 +12,8 @@ class Client:
     _cert: serialization.SSHCertificate
     _ca_pubkey: serialization.SSHPublicKeyTypes
     public_key: serialization.SSHCertPublicKeyTypes
+    public_key_raw: bytes
+    fingerprint: str
 
     MIN_RSA_KEY_SIZE = 2048
     MIN_ECDSA_KEY_SIZE = 256
@@ -22,8 +24,14 @@ class Client:
             raise TypeError("Certificate must be of type SSHCertificate")
 
         self._cert = cert_to_be
-        self.public_key = cert_to_be.public_key()
         self._ca_pubkey = ca_public_key
+
+        self.public_key = cert_to_be.public_key()
+        self.public_key_raw = serialization.ssh.serialize_ssh_public_key(self.public_key)
+        self.fingerprint = self._fingerprint()
+
+    def _fingerprint(self):
+        return hashlib.sha256(self.public_key_raw).hexdigest()
 
     def is_cert_valid(self) -> bool:
         """Used to determine if the certificate is valid.
@@ -111,15 +119,27 @@ class Client:
 class Gate:
     nonce_size: int
     public_key: serialization.SSHPublicKeyTypes
+    _outbox: Outbox
+    _ban_repository: BanRepository
+    _log_repository: LogRepository
 
-    def __init__(self, nonce_size:int=16, ca_pubkey_file="crypto/ca_key.pub"):
+    gate_type: str
+
+    def __init__(self, gate_type:str, log_repository: LogRepository, ban_repository: BanRepository, nonce_size:int=16, ca_pubkey_file="crypto/ca_key.pub"):
+        self.gate_type = gate_type
+        if self.gate_type.lower() not in ["entry", "exit"]:
+            self.gate_type = "exit"
+
         self.nonce_size = nonce_size
+        self._ban_repository = ban_repository
+        self._log_repository = log_repository
+
         with open(ca_pubkey_file, "rb") as f:
             self._ca_pubkey = serialization.load_ssh_public_key(f.read())
 
     async def client_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         print("[*] Client Handler | Client connected! Waiting for public key...", end=" ")
-        client_cert_raw = await reader.readline()
+        client_cert_raw = await reader.read(1024)
         print(f"received public key (length: {len(client_cert_raw.strip())})")
 
         try:
@@ -127,10 +147,12 @@ class Gate:
 
             # check client pubkey
             if not client.is_cert_valid():
-                pass
+                print("[!] Client Handler | Certificate not valid!")
+                raise InvalidSignature
 
             if not client.is_key_algo_secure():
-                pass
+                raise UnsupportedAlgorithm
+
 
             # send NONCE to client
             nonce = os.urandom(self.nonce_size)
@@ -140,11 +162,10 @@ class Gate:
             response = await reader.read(1024)
 
             if client.verify_signature(nonce, response):
-                outbox = await Outbox.create()
-                loaded_key = ssh.serialize_ssh_public_key(client.public_key)
-
-                if await Inbox.check_client(loaded_key):
-                    await outbox.log(loaded_key)
+                if not await self._ban_repository.is_banned(client.fingerprint):
+                    result = await self._log_repository.append_log(client.public_key_raw, self.gate_type)
+                    if not result:
+                        print("[!] Log entry may have not been created.")
 
                     print("[*] Client Handler | OK. Gate open")
                     writer.write(b"OK")
@@ -158,7 +179,14 @@ class Gate:
             else:
                 raise InvalidSignature
 
-        except InvalidSignature:
-            print(f"[!] Client Handler | Invalid signature")
+        except InvalidSignature|UnsupportedAlgorithm as e:
+            if isinstance(e, InvalidSignature):
+                print(f"[!] Client Handler | Invalid signature")
+            else:
+                print(f"[!] Client Handler | Unsupported key algorithm or unsupported key length")
+
             writer.write(b"FAIL")
             await writer.drain()
+
+        finally:
+            writer.close()
