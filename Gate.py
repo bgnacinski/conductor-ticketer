@@ -179,7 +179,7 @@ class Gate:
             else:
                 raise InvalidSignature
 
-        except InvalidSignature|UnsupportedAlgorithm as e:
+        except (InvalidSignature, UnsupportedAlgorithm) as e:
             if isinstance(e, InvalidSignature):
                 print(f"[!] Client Handler | Invalid signature")
             else:

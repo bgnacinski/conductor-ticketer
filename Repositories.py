@@ -125,7 +125,7 @@ class LogRepository:
         placeholders = ",".join("?" * len(ids))
 
         try:
-            await self._db.execute(f"UPDATE outbox SET next_retry_at = ? WHERE id IN ({placeholders})",
+            await self._db.execute(f"UPDATE outbox SET next_retry_at = ?, status='FAILED' WHERE id IN ({placeholders})",
                                    (next_retry(self._retry_delay_base, self._retry_delay_cap), *ids))
             await self._db.commit()
 

@@ -8,9 +8,10 @@ import os
 
 # API-related variables
 API_URL = os.getenv("API_URL") or "http://localhost/api/"
-API_URL = API_URL + "/" if API_URL.endswith("/") else API_URL
+API_URL = API_URL + "/" if not API_URL.endswith("/") else API_URL
 API_KEY = os.getenv("API_KEY") or ""
 BULK_PUSH = str(os.getenv("BULK_PUSH")).lower() in ("true", "yes")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE") or 500)
 API_PULL_INTERVAL = int(os.getenv("API_PULL_INTERVAL") or 86400)
 API_PUSH_INTERVAL = int(os.getenv("API_PUSH_INTERVAL") or 1800)
 
@@ -98,7 +99,7 @@ async def setup():
     ban_repo = Repositories.BanRepository(db)
 
     ib = Inbox(API_URL, API_KEY, ban_repo, CA_PUBKEY_FILE)
-    ob = Outbox(API_URL, API_KEY, log_repo)
+    ob = Outbox(API_URL, API_KEY, log_repo, BATCH_SIZE)
 
     await api_pull(ib)
 
