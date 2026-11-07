@@ -1,8 +1,17 @@
-GATE_TYPE= #entry/exit
-NONCE_SIZE=32
-DB_FILE=db/outbox.db
+# API-related
 API_URL=http://localhost:8080/api/
 API_KEY=
-BULK_PUSH=false
-PUSH_INTERVAL=1800
-BATCH_SIZE=500
+BULK_PUSH=true/false
+API_PUSH_INTERVAL=1800 [s]
+API_PULL_INTERVAL=86400 [s]
+BATCH_SIZE=500 [items]
+
+# gate-related
+GATE_TYPE=entry/exit
+BIND_ADDRESS=localhost
+BIND_PORT=2137
+NONCE_SIZE=32 [bytes]
+
+# other
+DB_FILE=db/outbox.db
+CA_PUBKEY_FILE=crypto/ca_key.pub

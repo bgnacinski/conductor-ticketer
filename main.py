@@ -15,6 +15,8 @@ API_PULL_INTERVAL = int(os.getenv("API_PULL_INTERVAL") or 86400)
 API_PUSH_INTERVAL = int(os.getenv("API_PUSH_INTERVAL") or 1800)
 
 # gate-related variables
+BIND_ADDRESS = os.getenv("BIND_ADDRESS") or ""
+BIND_PORT = int(os.getenv("BIND_PORT") or 2137)
 GATE_TYPE = os.getenv("GATE_TYPE") or "exit"
 NONCE_SIZE = int(os.getenv("NONCE_SIZE") or 16)
 
@@ -68,7 +70,7 @@ async def gate_handler(inbox: Inbox, outbox: Outbox, log_repository: Repositorie
     api_pull_task = asyncio.create_task(api_pull_loop(inbox))
 
     try:
-        server = await asyncio.start_server(gate.client_handler, "localhost", 2137)
+        server = await asyncio.start_server(gate.client_handler, BIND_ADDRESS, BIND_PORT)
 
         print("[*] Gate Handler | Waiting for clients...")
         await server.serve_forever()
