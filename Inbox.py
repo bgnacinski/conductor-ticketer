@@ -3,6 +3,7 @@ from Repositories import BanRepository
 import base64
 import httpx
 import os
+from loguru import logger
 
 class Inbox:
     _ban_repository: BanRepository
@@ -16,7 +17,7 @@ class Inbox:
         self._ban_repository = ban_repository
         self._ca_public_key_file = ca_public_key_file
 
-    async def fetch_pubkey(self):
+    async def fetch_pubkey(self) -> None:
         headers = {
             "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
             "Authorization": f"Bearer {self._api_key}",
@@ -43,33 +44,27 @@ class Inbox:
                             file.close()
 
                         valid_pubkey = True
-                        print("done!")
-
-                        return True
+                        logger.info("CA public key retrieved and saved successfully")
 
                     except Exception as e:
                         valid_pubkey = False
-                        print(f"[!] Cannot save the retrieved key due to errors: {e}. Trying to use existing key...",
-                              end=" ")
+                        logger.warning(f"Cannot save the retrieved key due to errors: {e}. Trying to use existing key...")
 
         except Exception as e:
-            print(f"An error during API querying occurred: {e}")
+            logger.error(f"An error during API querying occurred: {e}")
 
         if not valid_pubkey:
             with open(self._ca_public_key_file, "rb") as file:
                 pubkey_raw = file.read()
                 try:
                     serialization.load_ssh_public_key(pubkey_raw)
-                    print("[!] Unable to retrieve public key from API, using the old one.")
-                    return True
+                    logger.warning("Unable to retrieve public key from API, using the old one.")
 
                 except Exception as e:
-                    print("[!] Unable to load any public key due to errors. Quitting...")
+                    logger.critical("Unable to load any public key due to errors. Quitting...")
                     raise e
 
-        return False
-
-    async def fetch_bans(self) -> bool:
+    async def fetch_bans(self) -> None:
         headers = {
             "User-Agent": os.getenv("User-Agent") or "Ticketer/unknown",
             "Authorization": f"Bearer {self._api_key}",
@@ -88,14 +83,10 @@ class Inbox:
                     if res_data["status"] == "success":
                         await self._ban_repository.ban_bulk(res_data["data"])
 
-                    print("done!")
-                    return True
+                    logger.info("Ban list retrieved and updated successfully")
 
                 else:
-                    print("Not done!")
-                    return False
+                    logger.warning("Failed to retrieve ban list from API")
 
         except Exception as e:
-            print(f"An error occurred: {e}")
-
-        return False
+            logger.error(f"An error occurred while fetching bans: {e}")

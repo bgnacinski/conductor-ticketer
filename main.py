@@ -1,10 +1,12 @@
-import Repositories
-from Gate import Gate
+from loguru import logger
 from Outbox import Outbox
 from Inbox import Inbox
+from Gate import Gate
+import Repositories
 import aiosqlite
 import asyncio
 import os
+import sys
 
 # API-related variables
 API_URL = os.getenv("API_URL") or "http://localhost/api/"
@@ -25,11 +27,31 @@ NONCE_SIZE = int(os.getenv("NONCE_SIZE") or 16)
 DB_FILE = os.getenv("DB_FILE") or "outbox.db"
 CA_PUBKEY_FILE = os.getenv("CA_PUBKEY_FILE") or "crypto/ca_key.pub"
 
-async def prepare_dbs(db_file:str) -> aiosqlite.Connection:
-    print("[*] Preparing DBs...", end=" ")
+def init_logger():
+    logger.remove()
 
-    conn = await aiosqlite.connect(db_file)
-    await conn.execute("""
+    logger.add(
+        sys.stderr,
+        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+        level="INFO"
+    )
+
+    logger.add(
+        "server.log",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+        level="DEBUG",
+        rotation="10 MB",
+        retention="10 days",
+        compression="zip",
+        encoding="utf-8"
+    )
+
+async def prepare_db(db_file:str) -> aiosqlite.Connection:
+    logger.info("Preparing DB...")
+
+    try:
+        conn = await aiosqlite.connect(db_file)
+        await conn.execute("""
                     CREATE TABLE IF NOT EXISTS "outbox"
                     (
                          id                 TEXT PRIMARY KEY,
@@ -40,30 +62,34 @@ async def prepare_dbs(db_file:str) -> aiosqlite.Connection:
                          next_retry_at      DATETIME,
                          error_message      TEXT
                     )""")
-    await conn.execute("""
+        await conn.execute("""
                     CREATE TABLE IF NOT EXISTS "bans"
                     (
                         client_fingerprint BLOB not null
                         constraint bans_pk primary key
                     )""")
 
-    await conn.commit()
+        await conn.commit()
 
-    await conn.execute("PRAGMA journal_mode = WAL;")
-    await conn.execute("PRAGMA synchronous = FULL;")
-    await conn.execute("PRAGMA wal_checkpoint(FULL);")
+        await conn.execute("PRAGMA journal_mode = WAL;")
+        await conn.execute("PRAGMA synchronous = FULL;")
+        await conn.execute("PRAGMA wal_checkpoint(FULL);")
 
-    print("done!")
+    except aiosqlite.Error as e:
+        logger.exception(f"Failed to prepare database ({db_file}): {e}")
+        raise
+
+    logger.info("DB prepared successfully")
 
     return conn
 
 async def api_pull(inbox: Inbox):
-    print("[*] Retrieving CA's public key from API...", end=" ")
-    pubkey = await inbox.fetch_pubkey()
+    logger.info("Retrieving CA's public key from API...")
+    await inbox.fetch_pubkey()
 
     # get bans
-    print("[*] Retrieving ban list from API...", end=" ")
-    bans = await inbox.fetch_bans()
+    logger.info("Retrieving ban list from API...")
+    await inbox.fetch_bans()
 
 async def gate_handler(inbox: Inbox, outbox: Outbox, log_repository: Repositories.LogRepository, ban_repository: Repositories.BanRepository):
     gate = Gate(GATE_TYPE, log_repository, ban_repository, NONCE_SIZE, CA_PUBKEY_FILE)
@@ -73,7 +99,7 @@ async def gate_handler(inbox: Inbox, outbox: Outbox, log_repository: Repositorie
     try:
         server = await asyncio.start_server(gate.client_handler, BIND_ADDRESS, BIND_PORT)
 
-        print("[*] Gate Handler | Waiting for clients...")
+        logger.info("Waiting for clients...")
         await server.serve_forever()
 
     finally:
@@ -85,15 +111,17 @@ async def gate_handler(inbox: Inbox, outbox: Outbox, log_repository: Repositorie
 async def api_push_loop(outbox: Outbox):
     while True:
         await outbox.push(BULK_PUSH)
+        logger.debug(f"Next push cycle in {API_PUSH_INTERVAL} seconds")
         await asyncio.sleep(API_PUSH_INTERVAL)
 
 async def api_pull_loop(inbox: Inbox):
     while True:
+        logger.debug(f"Next pull cycle in {API_PULL_INTERVAL} seconds")
         await asyncio.sleep(API_PULL_INTERVAL)
         await api_pull(inbox)
 
 async def setup():
-    db = await prepare_dbs(DB_FILE)
+    db = await prepare_db(DB_FILE)
     log_repo = Repositories.LogRepository(db)
     await log_repo.cleanup()
     ban_repo = Repositories.BanRepository(db)
@@ -106,6 +134,8 @@ async def setup():
     return db, ib, ob, log_repo, ban_repo
 
 async def launcher():
+    init_logger()
+
     db, ib, ob, log_repo, ban_repo = await setup()
     await gate_handler(ib, ob, log_repo, ban_repo)
 

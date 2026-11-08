@@ -7,6 +7,7 @@ import hashlib
 import time
 import asyncio
 import os
+from loguru import logger
 
 class Client:
     _cert: serialization.SSHCertificate
@@ -40,23 +41,23 @@ class Client:
             self._cert.verify_cert_signature()
 
             if self._cert.signature_key() != self._ca_pubkey:
-                print("[!] Client Handler | Invalid certificate - not signed by CA!")
+                logger.error("Invalid certificate - not signed by CA!")
                 return False
 
             if self._cert.valid_after <= time.time() <= self._cert.valid_before:
-                print("[*] Client Handler | Valid certificate")
+                logger.info("Valid certificate")
 
                 return True
 
             else:
-                print(f"[!] Client Handler | Certificate expired (valid between {self._cert.valid_after}-{self._cert.valid_before})!")
+                logger.error(f"Certificate expired (valid between {self._cert.valid_after}-{self._cert.valid_before})!")
                 return False
 
         except InvalidSignature:
-            print("[!] Client Handler | Invalid certificate - wrong signature")
+            logger.error("Invalid certificate - wrong signature")
             return False
         except Exception as e:
-            print(f"[!] Client Handler | Certificate verification error: {e!r}")
+            logger.error(f"Certificate verification error: {e!r}")
             return False
 
     def is_key_algo_secure(self) -> bool:
@@ -112,7 +113,7 @@ class Client:
                 return True
 
         except Exception as e:
-            print(f"[!] Exception raised: {e}")
+            logger.exception(f"Unexpected exception during signature verification: {e}")
 
         return False
 
@@ -138,21 +139,21 @@ class Gate:
             self._ca_pubkey = serialization.load_ssh_public_key(f.read())
 
     async def client_handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        print("[*] Client Handler | Client connected! Waiting for public key...", end=" ")
+        logger.info("Client connected! Waiting for public key...")
         client_cert_raw = await reader.read(1024)
-        print(f"received public key (length: {len(client_cert_raw.strip())})")
+        logger.debug(f"received public key (length: {len(client_cert_raw.strip())})")
 
         try:
             client = Client(self._ca_pubkey, client_cert_raw)
             if await self._ban_repository.is_banned(client.fingerprint):
                 writer.write(b"FAIL")
                 await writer.drain()
-                print("[!] Client Handler | Client is banned!")
+                logger.info("Client is banned!")
                 return
 
             # check client pubkey
             if not client.is_cert_valid():
-                print("[!] Client Handler | Certificate not valid!")
+                logger.warning("Certificate not valid!")
                 raise InvalidSignature
 
             if not client.is_key_algo_secure():
@@ -168,9 +169,9 @@ class Gate:
             if client.verify_signature(nonce, response):
                 result = await self._log_repository.append_log(client.public_key_raw, self.gate_type)
                 if not result:
-                    print("[!] Log entry may have not been created.")
+                    logger.warning("Log entry may have not been created.")
 
-                print("[*] Client Handler | OK. Gate open")
+                logger.info("OK. Gate open")
                 writer.write(b"OK")
                 await writer.drain()
 
@@ -179,9 +180,9 @@ class Gate:
 
         except (InvalidSignature, UnsupportedAlgorithm) as e:
             if isinstance(e, InvalidSignature):
-                print(f"[!] Client Handler | Invalid signature")
+                logger.warning("Invalid signature")
             else:
-                print(f"[!] Client Handler | Unsupported key algorithm or unsupported key length")
+                logger.warning("Unsupported key algorithm or unsupported key length")
 
             writer.write(b"FAIL")
             await writer.drain()

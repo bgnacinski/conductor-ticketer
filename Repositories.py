@@ -4,6 +4,7 @@ from math import ceil
 import aiosqlite
 import hashlib
 import random
+from loguru import logger
 
 
 class BanRepository:
@@ -28,7 +29,7 @@ class BanRepository:
                 return True
 
         except aiosqlite.Error as e:
-            print(f"[!] DB Error: {e}")
+            logger.error(f"DB Error: {e}")
 
         # not banned by default
         return False
@@ -47,13 +48,13 @@ class BanRepository:
             return True
 
         except aiosqlite.IntegrityError:
-            print("[!] Duplicate client fingerprint, saving may have not been performed!")
+            logger.warning("Duplicate client fingerprint, saving may have not been performed!")
 
         except aiosqlite.OperationalError:
-            print("[!] Operational error occurred, saving may have not been performed!")
+            logger.warning("Operational error occurred, saving may have not been performed!")
 
         except aiosqlite.Error as e:
-            print(f"[!] SQLite error: {e}, saving may have not been performed!")
+            logger.error(f"SQLite error: {e}, saving may have not been performed!")
 
         return False
 
@@ -65,7 +66,7 @@ class BanRepository:
             return True
 
         except aiosqlite.Error as e:
-            print(f"[!] DB error: {e}, clear may have not been performed!")
+            logger.error(f"DB error: {e}, clear may have not been performed!")
 
         return False
 
@@ -114,7 +115,7 @@ class LogRepository:
             return True
 
         except aiosqlite.Error as e:
-            print(f"DB error: {e}, data may have not been saved!")
+            logger.error(f"DB error: {e}, data may have not been saved!")
             return False
 
     async def retard_sync(self, ids: list[int]) -> bool:
@@ -132,7 +133,7 @@ class LogRepository:
             return True
 
         except aiosqlite.Error as e:
-            print(f"[!] DB error during sync retardation: {e}")
+            logger.error(f"DB error during sync retardation: {e}")
 
         return False
 
@@ -145,7 +146,7 @@ class LogRepository:
             return True
 
         except aiosqlite.Error as e:
-            print(f"[!] DB Error: {e}")
+            logger.error(f"DB Error: {e}")
 
         return False
 
@@ -156,7 +157,7 @@ class LogRepository:
             await self._db.commit()
 
         except aiosqlite.Error as e:
-            print(f"[!] DB Error: {e}")
+            logger.error(f"DB Error: {e}")
 
     def close(self):
         self._db.close()
