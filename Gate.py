@@ -144,6 +144,11 @@ class Gate:
 
         try:
             client = Client(self._ca_pubkey, client_cert_raw)
+            if await self._ban_repository.is_banned(client.fingerprint):
+                writer.write(b"FAIL")
+                await writer.drain()
+                print("[!] Client Handler | Client is banned!")
+                return
 
             # check client pubkey
             if not client.is_cert_valid():
@@ -153,7 +158,6 @@ class Gate:
             if not client.is_key_algo_secure():
                 raise UnsupportedAlgorithm
 
-
             # send NONCE to client
             nonce = os.urandom(self.nonce_size)
             writer.write(nonce)
@@ -162,19 +166,13 @@ class Gate:
             response = await reader.read(1024)
 
             if client.verify_signature(nonce, response):
-                if not await self._ban_repository.is_banned(client.fingerprint):
-                    result = await self._log_repository.append_log(client.public_key_raw, self.gate_type)
-                    if not result:
-                        print("[!] Log entry may have not been created.")
+                result = await self._log_repository.append_log(client.public_key_raw, self.gate_type)
+                if not result:
+                    print("[!] Log entry may have not been created.")
 
-                    print("[*] Client Handler | OK. Gate open")
-                    writer.write(b"OK")
-                    await writer.drain()
-
-                else:
-                    print("[*] Client Handler | BANNED!")
-                    writer.write(b"BANNED")
-                    await writer.drain()
+                print("[*] Client Handler | OK. Gate open")
+                writer.write(b"OK")
+                await writer.drain()
 
             else:
                 raise InvalidSignature
