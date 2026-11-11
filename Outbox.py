@@ -1,3 +1,4 @@
+import json
 from math import ceil
 import Repositories
 import httpx
@@ -75,7 +76,13 @@ class Outbox:
 
                             return
 
-                        response = res.json()
+                        try:
+                            response = res.json()
+
+                        except json.decoder.JSONDecodeError:
+                            print(res.text)
+                            logger.exception("Unable to parse response")
+                            res.status_code = 500
 
                         if res.status_code in (200, 201):
                             result = await self._log_repository.update_status(batch_ids, "SENT")
@@ -106,6 +113,7 @@ class Outbox:
 
                         elif res.status_code // 100 == 5:
                             logger.error(f"API Server HTTP error: {res.status_code}. Unable to push data")
+
                             result = await self._log_repository.retard_sync(batch_ids)
                             if not result:
                                 logger.error("Due to errors, database state may not reflect changes requested by the API response")
@@ -140,7 +148,7 @@ class Outbox:
                             elif res.status_code == 422:
                                 failed_ids = response["failed"]
 
-                                logger.warning(f"HTTP 422 - Permanently removing {len(failed_ids)} from queue due to validation errors.")
+                                logger.warning(f"HTTP 422 - Permanently removing {len(failed_ids)} elements from queue due to validation errors.")
                                 result = await self._log_repository.update_status(failed_ids, "VALERR")
                                 if not result:
                                     logger.error("Due to errors, database state may not reflect changes requested by the API response")

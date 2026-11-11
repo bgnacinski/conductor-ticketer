@@ -40,7 +40,7 @@ class BanRepository:
             no_batches = int(ceil(len(client_fingerprints) / self._batch_size))
             for i in range(0, no_batches):
                 batch_fingerprints = client_fingerprints[self._batch_size * i:self._batch_size * (i + 1)]
-                batch_placeholders = ",".join("(?)" * len(batch_fingerprints))
+                batch_placeholders = ("(?)," * len(batch_fingerprints))[:-1]
                 await self._db.execute(f"INSERT INTO bans (client_fingerprint) VALUES {batch_placeholders}",
                                        (*batch_fingerprints,))
                 await self._db.commit()
@@ -48,10 +48,10 @@ class BanRepository:
             return True
 
         except aiosqlite.IntegrityError:
-            logger.warning("Duplicate client fingerprint, saving may have not been performed!")
+            logger.exception("Duplicate client fingerprint, saving may have not been performed!")
 
-        except aiosqlite.OperationalError:
-            logger.warning("Operational error occurred, saving may have not been performed!")
+        except aiosqlite.OperationalError as e:
+            logger.exception(f"Operational error occurred, saving may have not been performed!")
 
         except aiosqlite.Error as e:
             logger.error(f"SQLite error: {e}, saving may have not been performed!")
@@ -121,7 +121,7 @@ class LogRepository:
     async def retard_sync(self, ids: list[int]) -> bool:
         def next_retry(base: float = 5, cap: float = 900) -> str:
             delay = random.uniform(base, cap)
-            return (datetime.now(timezone.utc) + timedelta(minutes=delay)).strftime("%Y-%m-%d %H:%M:%S")
+            return (datetime.now(timezone.utc) + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
 
         placeholders = ",".join("?" * len(ids))
 
