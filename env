@@ -1,3 +1,6 @@
+LOG_LEVEL=DEBUG
+LOG_FILE=server.log
+
 # API-related
 API_URL=http://localhost:8080/api/
 API_KEY=

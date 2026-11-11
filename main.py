@@ -8,6 +8,9 @@ import asyncio
 import os
 import sys
 
+LOG_LEVEL = os.getenv("LOG_LEVEL") or "INFO"
+LOG_FILE = os.getenv("LOG_FILE") or "server.log"
+
 # API-related variables
 API_URL = os.getenv("API_URL") or "http://localhost/api/"
 API_URL = API_URL + "/" if not API_URL.endswith("/") else API_URL
@@ -33,13 +36,13 @@ def init_logger():
     logger.add(
         sys.stderr,
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
-        level="INFO"
+        level=LOG_LEVEL,
     )
 
     logger.add(
-        "server.log",
+        LOG_FILE,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        level="DEBUG",
+        level=LOG_LEVEL,
         rotation="10 MB",
         retention="10 days",
         compression="zip",
@@ -110,6 +113,7 @@ async def gate_handler(inbox: Inbox, outbox: Outbox, log_repository: Repositorie
 
 async def api_push_loop(outbox: Outbox):
     while True:
+        logger.debug(f"Pushing data...")
         await outbox.push(BULK_PUSH)
         logger.debug(f"Next push cycle in {API_PUSH_INTERVAL} seconds")
         await asyncio.sleep(API_PUSH_INTERVAL)
@@ -118,6 +122,7 @@ async def api_pull_loop(inbox: Inbox):
     while True:
         logger.debug(f"Next pull cycle in {API_PULL_INTERVAL} seconds")
         await asyncio.sleep(API_PULL_INTERVAL)
+        logger.debug(f"Pulling data...")
         await api_pull(inbox)
 
 async def setup():
