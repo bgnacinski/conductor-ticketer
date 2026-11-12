@@ -1,5 +1,6 @@
 from cryptography.hazmat.primitives import serialization
-from Repositories import BanRepository
+from Repositories import BanRepository, LastPerformedRepository
+import datetime
 import base64
 import httpx
 import os
@@ -11,11 +12,14 @@ class Inbox:
     _api_key: str
     _ca_public_key_file: str
 
-    def __init__(self, base_url: str, api_key: str, ban_repository: BanRepository, ca_public_key_file: str):
+    def __init__(self, base_url: str, api_key: str, ban_repository: BanRepository, ca_public_key_file: str,
+                 last_performed_repository: LastPerformedRepository, incremental_ban_pull: bool=True) -> None:
         self._base_url = base_url
         self._api_key = api_key
         self._ban_repository = ban_repository
+        self._last_performed_repository = last_performed_repository
         self._ca_public_key_file = ca_public_key_file
+        self._incremental_ban_pull = incremental_ban_pull
 
     async def fetch_pubkey(self) -> None:
         headers = {
@@ -72,21 +76,49 @@ class Inbox:
         }
         url = self._base_url + "bans"
 
+        if self._incremental_ban_pull:
+            newest_ban = await self._last_performed_repository.get_last_ban_sync()
+
+            params = {
+                "output_type": "list",
+                "newer_than": newest_ban,
+            }
+
+        else:
+            params = {
+                "output_type": "list"
+            }
+
         try:
             async with httpx.AsyncClient(headers=headers) as client:
-                res = await client.get(url, params={"output_type": "list"})
-                res_data = res.json()
+                res = await client.get(url, params=params)
+                try:
+                    res_data = res.json()
+                except Exception as e:
+                    logger.exception(f"An error occurred while retrieving bans: {e}")
 
                 if res.is_success:
-                    await self._ban_repository.clear_bans()
+                    if self._incremental_ban_pull:
+                        banned = res_data["data"]["banned"]
+                        unbanned = res_data["data"]["unbanned"]
 
-                    if res_data["status"] == "success":
-                        await self._ban_repository.ban_bulk(res_data["data"])
+                        if banned:
+                            await self._ban_repository.bulk_change(banned, True)
+                        if unbanned:
+                            await self._ban_repository.bulk_change(unbanned, False)
+
+                    else:
+                        await self._ban_repository.clear_bans()
+
+                        if res_data["status"] == "success":
+                            await self._ban_repository.bulk_change(res_data["data"], True)
 
                     logger.info("Ban list retrieved and updated successfully")
+
+                    await self._last_performed_repository.ban_sync()
 
                 else:
                     logger.warning("Failed to retrieve ban list from API")
 
         except Exception as e:
-            logger.error(f"An error occurred while fetching bans: {e}")
+            logger.exception(f"An error occurred while fetching bans: {e}")

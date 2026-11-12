@@ -34,15 +34,21 @@ class BanRepository:
         # not banned by default
         return False
 
-    async def ban_bulk(self, client_fingerprints: list) -> bool:
+    async def bulk_change(self, client_fingerprints: list, ban:bool=True) -> bool:
         try:
             # splitting data into batches
             no_batches = int(ceil(len(client_fingerprints) / self._batch_size))
             for i in range(0, no_batches):
                 batch_fingerprints = client_fingerprints[self._batch_size * i:self._batch_size * (i + 1)]
-                batch_placeholders = ("(?)," * len(batch_fingerprints))[:-1]
-                await self._db.execute(f"INSERT INTO bans (client_fingerprint) VALUES {batch_placeholders}",
-                                       (*batch_fingerprints,))
+
+                if ban:
+                    batch_placeholders = ("(?)," * len(batch_fingerprints))[:-1]
+                    await self._db.execute(f"INSERT INTO bans (client_fingerprint) VALUES {batch_placeholders}",
+                                           (*batch_fingerprints,))
+                else:
+                    batch_placeholders = ",".join("?" * len(batch_fingerprints))
+                    await self._db.execute(f"DELETE FROM bans WHERE client_fingerprint IN ({batch_placeholders})", (*batch_fingerprints,))
+
                 await self._db.commit()
 
             return True
@@ -158,6 +164,32 @@ class LogRepository:
 
         except aiosqlite.Error as e:
             logger.error(f"DB Error: {e}")
+
+    def close(self):
+        self._db.close()
+
+class LastPerformedRepository:
+    _db: aiosqlite.Connection
+
+    last_ban_sync: datetime
+
+    def __init__(self, db: aiosqlite.Connection):
+        self._db = db
+
+    async def get_last_ban_sync(self) -> str:
+        cur = await self._db.execute("SELECT performed_at FROM last_performed_at WHERE action_type = 'ban_sync'")
+        raw_data = await cur.fetchone()
+        await cur.close()
+
+        return raw_data[0]
+
+    async def ban_sync(self):
+        try:
+            await self._db.execute("UPDATE last_performed_at SET performed_at = ? WHERE action_type = 'ban_sync'", (datetime.now().isoformat(), ))
+            await self._db.commit()
+
+        except aiosqlite.Error as e:
+            logger.exception(f"DB Error: {e}")
 
     def close(self):
         self._db.close()

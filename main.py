@@ -4,6 +4,7 @@ from Inbox import Inbox
 from Gate import Gate
 import Repositories
 import aiosqlite
+import datetime
 import asyncio
 import os
 import sys
@@ -18,6 +19,7 @@ API_KEY = os.getenv("API_KEY") or ""
 BULK_PUSH = str(os.getenv("BULK_PUSH")).lower() in ("true", "yes")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE") or 500)
 API_PULL_INTERVAL = int(os.getenv("API_PULL_INTERVAL") or 86400)
+INCREMENTAL_BAN_PULL = str(os.getenv("INCREMENTAL_BAN_PULL")).lower() in ("true", "yes")
 API_PUSH_INTERVAL = int(os.getenv("API_PUSH_INTERVAL") or 1800)
 
 # gate-related variables
@@ -68,9 +70,27 @@ async def prepare_db(db_file:str) -> aiosqlite.Connection:
         await conn.execute("""
                     CREATE TABLE IF NOT EXISTS "bans"
                     (
-                        client_fingerprint BLOB not null
-                        constraint bans_pk primary key
+                        client_fingerprint BLOB not null constraint bans_pk primary key,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )""")
+
+        await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS "last_performed_at"
+                    (
+                        action_name TEXT NOT NULL,
+                        performed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )        
+        """)
+        await conn.commit()
+
+        # see if any actions have been performed
+        cur = await conn.execute("SELECT COUNT(*) FROM last_performed_at")
+        num_rows = await cur.fetchone()
+        await cur.close()
+
+        if num_rows[0] == 0:
+            await conn.execute("DELETE FROM last_performed_at WHERE 1")
+            await conn.execute("INSERT INTO last_performed_at(action_type, performed_at) VALUES ('ban_sync', ?)", (datetime.datetime.fromtimestamp(0).isoformat(),))
 
         await conn.commit()
 
@@ -130,8 +150,9 @@ async def setup():
     log_repo = Repositories.LogRepository(db)
     await log_repo.cleanup()
     ban_repo = Repositories.BanRepository(db)
+    last_perf_repo = Repositories.LastPerformedRepository(db)
 
-    ib = Inbox(API_URL, API_KEY, ban_repo, CA_PUBKEY_FILE)
+    ib = Inbox(API_URL, API_KEY, ban_repo, CA_PUBKEY_FILE, last_perf_repo, INCREMENTAL_BAN_PULL)
     ob = Outbox(API_URL, API_KEY, log_repo, BATCH_SIZE)
 
     await api_pull(ib)
